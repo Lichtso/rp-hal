@@ -1,583 +1,787 @@
 //! Universal Serial Bus (USB)
-// See [Chapter 4 Section 1](https://datasheets.raspberrypi.org/rp2040/rp2040_datasheet.pdf) for more details
+//!
+//! See [Chapter 4 Section 1](https://datasheets.raspberrypi.org/rp2040/rp2040_datasheet.pdf) for more details
+//!
 //! ## Usage
 //!
-//! Initialize the Usb Bus forcing the VBUS detection.
 //! ```no_run
-//! use rp2040_hal::{clocks::init_clocks_and_plls, pac, sio::Sio, usb::UsbBus, watchdog::Watchdog};
-//! use usb_device::class_prelude::UsbBusAllocator;
-//!
-//! const XOSC_CRYSTAL_FREQ: u32 = 12_000_000; // Typically found in BSP crates
+//! use rp2040_hal::{pac, watchdog, clocks, usb};
 //!
 //! let mut pac = pac::Peripherals::take().unwrap();
-//! let sio = Sio::new(pac.SIO);
-//! let mut watchdog = Watchdog::new(pac.WATCHDOG);
-//! let mut clocks = init_clocks_and_plls(
-//!     XOSC_CRYSTAL_FREQ,
-//!     pac.XOSC,
-//!     pac.CLOCKS,
-//!     pac.PLL_SYS,
-//!     pac.PLL_USB,
-//!     &mut pac.RESETS,
-//!     &mut watchdog
+//! let mut watchdog = watchdog::Watchdog::new(pac.WATCHDOG);
+//! const XOSC_CRYSTAL_FREQ: u32 = 12_000_000;
+//! let _clocks = clocks::init_clocks_and_plls(
+//!     XOSC_CRYSTAL_FREQ, pac.XOSC, pac.CLOCKS, pac.PLL_SYS, pac.PLL_USB, &mut pac.RESETS, &mut watchdog,
 //! ).ok().unwrap();
-//!
-//! let usb_bus = UsbBusAllocator::new(UsbBus::new(
-//!         pac.USBCTRL_REGS,
-//!         pac.USBCTRL_DPRAM,
-//!         clocks.usb_clock,
-//!         true,
-//!         &mut pac.RESETS,
-//!     ));
-//! // Use the usb_bus as usual.
+//! let mut usb = usb::UsbDevice::new(pac.USBCTRL_REGS, pac.USBCTRL_DPRAM, &mut pac.RESETS);
 //! ```
-//!
-//! See [pico_usb_serial.rs](https://github.com/rp-rs/rp-hal/tree/main/boards/pico/examples/pico_usb_serial.rs) for more complete examples
-//!
-//!
-//! ## Enumeration issue with small EP0 max packet size
-//!
-//! During enumeration Windows hosts send a `StatusOut` after the `DataIn` packet of the first
-//! `Get Descriptor` resquest even if the `DataIn` isn't completed (typically when the `max_packet_size_ep0`
-//! is less than 18bytes). The next request request is a `Set Address` that expect a `StatusIn`.
-//!
-//! The issue is that by the time the previous `DataIn` packet is acknoledged and the `StatusOut`
-//! followed by `Setup` are received, the usb stack may have already prepared the next `DataIn` payload
-//! in the EP0 IN mailbox resulting in the payload being transmitted to the host instead of the
-//! `StatusIn` for the `Set Address` request as expected by the host.
-//!
-//! To avoid that issue, the EP0 In mailbox should be invalidated between the `Setup` packet and the
-//! next `StatusIn` initiated by the host. The workaround implemented clears the available bit of the
-//! EP0 In endpoint's buffer to stop the device from sending the data instead of the status packet.
-//! This workaround has the caveat that the poll function must be called between those two which
-//! are only separated by a few microseconds.
-//!
-//! If the required timing cannot be met, using an maximum packet size of the endpoint 0 above 18bytes
-//! (e.g. `.max_packet_size_ep0(64)`) should avoid that issue.
 
-use core::cell::RefCell;
-
-use crate::clocks::UsbClock;
-use crate::pac::RESETS;
-use crate::pac::USBCTRL_DPRAM;
-use crate::pac::USBCTRL_REGS;
 use crate::resets::SubsystemReset;
+use core::ops::Deref;
+use pac::{generic::Reg, usbctrl_dpram, usbctrl_regs, RESETS};
 
-use cortex_m::interrupt::{self, Mutex};
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum RequestRecipient {
+    Device = 0,
+    Interface = 1,
+    Endpoint = 2,
+    Other = 3,
+}
 
-use usb_device::{
-    bus::{PollResult, UsbBus as UsbBusTrait},
-    endpoint::{EndpointAddress, EndpointType},
-    Result as UsbResult, UsbDirection, UsbError,
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum Request {
+    GetStatus = 0x00,
+    ClearFeature = 0x01,
+    SetFeature = 0x03,
+    SetAddress = 0x05,
+    GetDescriptor = 0x06,
+    SetDescriptor = 0x07,
+    GetConfiguration = 0x08,
+    SetConfiguration = 0x09,
+    GetInterface = 0x0A,
+    SetInterface = 0x11,
+    SynchFrame = 0x12,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+enum DescriptorType {
+    Device = 1,
+    Configuration = 2,
+    String = 3,
+    Interface = 4,
+    Endpoint = 5,
+    DeviceQualifier = 6,
+    OtherSpeedConfiguration = 7,
+    InterfacePower = 8,
+    OnTheGo = 9,
+    Debug = 10,
+    InterfaceAssociation = 11,
+}
+
+#[repr(C)]
+#[repr(packed)]
+#[allow(non_snake_case)]
+#[derive(Clone, Copy)]
+pub struct DeviceDescriptor {
+    bLength: u8,
+    bDescriptorType: DescriptorType,
+    bcdUSB: u16,
+    bDeviceClass: u8,
+    bDeviceSubClass: u8,
+    bDeviceProtocol: u8,
+    bMaxPacketSize0: u8,
+    idVendor: u16,
+    idProduct: u16,
+    bcdDevice: u16,
+    iManufacturer: u8,
+    iProduct: u8,
+    iSerialNumber: u8,
+    bNumConfigurations: u8,
+}
+
+#[repr(C)]
+#[repr(packed)]
+#[allow(non_snake_case)]
+#[derive(Clone, Copy)]
+pub struct ConfigurationDescriptor {
+    bLength: u8,
+    bDescriptorType: DescriptorType,
+    wTotalLength: u16,
+    bNumInterfaces: u8,
+    bConfigurationValue: u8,
+    iConfiguration: u8,
+    bmAttributes: u8,
+    bMaxPower: u8,
+}
+
+#[repr(C)]
+#[repr(packed)]
+#[allow(non_snake_case)]
+#[derive(Clone, Copy)]
+pub struct InterfaceDescriptor {
+    bLength: u8,
+    bDescriptorType: DescriptorType,
+    bInterfaceNumber: u8,
+    bAlternateSetting: u8,
+    bNumEndpoints: u8,
+    bInterfaceClass: u8,
+    bInterfaceSubClass: u8,
+    bInterfaceProtocol: u8,
+    iInterface: u8,
+}
+
+#[repr(C)]
+#[repr(packed)]
+#[allow(non_snake_case)]
+#[derive(Clone, Copy)]
+pub struct EndpointDescriptor {
+    bLength: u8,
+    bDescriptorType: DescriptorType,
+    bEndpointAddress: u8,
+    bmAttributes: u8,
+    wMaxPacketSize: u16,
+    bInterval: u8,
+}
+
+const NUMBER_OF_ENDPOINTS: u8 = 16;
+const BUFFERS_START_OFFSET: u16 = 0x180;
+const BUFFERS_END_OFFSET: u16 = 0x1000;
+
+static USB_DEVICE_DESCRIPTOR: DeviceDescriptor = DeviceDescriptor {
+    bLength: core::mem::size_of::<DeviceDescriptor>() as u8,
+    bDescriptorType: DescriptorType::Device,
+    bcdUSB: 0x0110,        // USB version
+    bDeviceClass: 0xEF,    // USB_CLASS_MISC
+    bDeviceSubClass: 2,    // MISC_SUBCLASS_COMMON
+    bDeviceProtocol: 1,    // MISC_PROTOCOL_IAD
+    bMaxPacketSize0: 64,   // Max packet size for ep0
+    idVendor: 0x2E8A,      // Raspberry Pi
+    idProduct: 0x000A,     // Pico SDK CDC
+    bcdDevice: 0x0100,     // No device revision number
+    iManufacturer: 1,      // String index
+    iProduct: 2,           // String index
+    iSerialNumber: 3,      // String index
+    bNumConfigurations: 1, // One configuration
 };
 
-fn ep_addr_to_ep_buf_ctrl_idx(ep_addr: EndpointAddress) -> usize {
-    ep_addr.index() * 2 + (if ep_addr.is_in() { 0 } else { 1 })
+static USB_CONFIGURATION_DESCRIPTOR: ConfigurationDescriptor = ConfigurationDescriptor {
+    bLength: core::mem::size_of::<ConfigurationDescriptor>() as u8,
+    bDescriptorType: DescriptorType::Configuration,
+    wTotalLength: (core::mem::size_of::<ConfigurationDescriptor>()
+        + core::mem::size_of::<InterfaceDescriptor>()
+        + core::mem::size_of::<EndpointDescriptor>() * 2) as u16,
+    bNumInterfaces: 1,
+    bConfigurationValue: 1, // Configuration 1
+    iConfiguration: 4,      // String index
+    bmAttributes: 0x80,     // attributes: Bus powered
+    bMaxPower: 250,         // 500ma
+};
+
+static USB_INTERFACE_DESCRIPTOR: InterfaceDescriptor = InterfaceDescriptor {
+    bLength: core::mem::size_of::<InterfaceDescriptor>() as u8,
+    bDescriptorType: DescriptorType::Interface,
+    bInterfaceNumber: 0,
+    bAlternateSetting: 0,
+    bNumEndpoints: 2,
+    bInterfaceClass: 0xFF, // USB_CLASS_VENDOR_SPECIFIC
+    bInterfaceSubClass: 0x00,
+    bInterfaceProtocol: 0x00,
+    iInterface: 5, // String index
+};
+
+const USB_STRING_TABLE: &[&'static str] =
+    &["Raspberry Pi", "Rust Pi Pico", "3.14159", "Testing", "Echo"];
+
+/// Pac USB control registers
+pub trait UsbController: Deref<Target = usbctrl_regs::RegisterBlock> + SubsystemReset {}
+impl UsbController for pac::USBCTRL_REGS {}
+
+/// Pac USB dpram
+pub trait UsbMemory: Deref<Target = usbctrl_dpram::RegisterBlock> {}
+impl UsbMemory for pac::USBCTRL_DPRAM {}
+
+enum BusState {
+    Device(UsbDevice),
+    // Host(UsbHost),
 }
-#[derive(Debug)]
-struct Endpoint {
-    ep_type: EndpointType,
-    max_packet_size: u16,
-    buffer_offset: u16,
+
+struct UsbCommon<C: UsbController, M: UsbMemory> {
+    controller: C,
+    memory: M,
 }
-impl Endpoint {
-    unsafe fn get_buf_parts(&self) -> (*mut u8, usize) {
-        const DPRAM_BASE: *mut u8 = USBCTRL_DPRAM::ptr() as *mut u8;
-        if self.ep_type == EndpointType::Control {
-            (DPRAM_BASE.offset(0x100), self.max_packet_size as usize)
-        } else {
-            (
-                DPRAM_BASE.offset(0x180 + (self.buffer_offset * 64) as isize),
-                self.max_packet_size as usize,
-            )
-        }
+
+impl<C: UsbController, M: UsbMemory> UsbCommon<C, M> {
+    fn endpoint_address_to_index(endpoint_address: u8) -> u8 {
+        (endpoint_address << 1) | ((endpoint_address >> 7) ^ 0x01)
     }
 
-    fn get_buf(&self) -> &'static [u8] {
+    fn endpoint_index_to_address(endpoint_index: u8) -> u8 {
+        (endpoint_index >> 1) | ((endpoint_index ^ 0x01) << 7)
+    }
+
+    fn endpoint_control_register(
+        &self,
+        endpoint_index: u8,
+    ) -> &'static Reg<usbctrl_dpram::ep1_in_control::EP1_IN_CONTROL_SPEC> {
         unsafe {
-            let (base, len) = self.get_buf_parts();
-            core::slice::from_raw_parts(base as *const _, len)
+            &*(&self.memory.ep1_in_control
+                as *const Reg<usbctrl_dpram::ep1_in_control::EP1_IN_CONTROL_SPEC>)
+                .add(endpoint_index as usize - 2)
         }
     }
-    fn get_buf_mut(&self) -> &'static mut [u8] {
+
+    fn endpoint_buffer_control_register(
+        &self,
+        endpoint_index: u8,
+    ) -> &'static Reg<usbctrl_dpram::ep0_in_buffer_control::EP0_IN_BUFFER_CONTROL_SPEC> {
         unsafe {
-            let (base, len) = self.get_buf_parts();
-            core::slice::from_raw_parts_mut(base, len)
-        }
-    }
-}
-
-struct Inner {
-    ctrl_reg: USBCTRL_REGS,
-    ctrl_dpram: USBCTRL_DPRAM,
-    in_endpoints: [Option<Endpoint>; 16],
-    out_endpoints: [Option<Endpoint>; 16],
-    next_offset: u16,
-    read_setup: bool,
-}
-impl Inner {
-    fn new(ctrl_reg: USBCTRL_REGS, ctrl_dpram: USBCTRL_DPRAM) -> Self {
-        Self {
-            ctrl_reg,
-            ctrl_dpram,
-            in_endpoints: Default::default(),
-            out_endpoints: Default::default(),
-            next_offset: 0,
-            read_setup: false,
+            &*(&self.memory.ep0_in_buffer_control
+                as *const Reg<usbctrl_dpram::ep0_in_buffer_control::EP0_IN_BUFFER_CONTROL_SPEC>)
+                .add(endpoint_index as usize)
         }
     }
 
-    fn ep_allocate(
+    fn endpoint_address_control_register(
+        &self,
+        endpoint_index: u8,
+    ) -> &'static Reg<usbctrl_regs::addr_endp1::ADDR_ENDP1_SPEC> {
+        unsafe {
+            &*(&self.controller.addr_endp1 as *const Reg<usbctrl_regs::addr_endp1::ADDR_ENDP1_SPEC>)
+                .add((endpoint_index as usize >> 1) - 1)
+        }
+    }
+
+    fn reset_endpoint_pids(&mut self) {
+        for endpoint_index in 2..NUMBER_OF_ENDPOINTS * 2 {
+            self.endpoint_buffer_control_register(endpoint_index)
+                .modify(|_, w| w.pid_0().clear_bit().pid_1().clear_bit());
+        }
+    }
+
+    fn handle_endpoint_buffers(&mut self) {
+        let needs_handling = self.controller.buff_status.read().bits();
+        for endpoint_index in 0..NUMBER_OF_ENDPOINTS * 2 {
+            if (needs_handling & (1 << endpoint_index)) != 0 {
+                // TODO: Trigger endpoint handler
+                self.endpoint_buffer_control_register(endpoint_index)
+                    .modify(|r, w| unsafe {
+                        w.pid_0()
+                            .bit(!r.pid_0().bit_is_set())
+                            .pid_1()
+                            .bit(!r.pid_1().bit_is_set())
+                    });
+            }
+        }
+        self.controller
+            .buff_status
+            .write(|w| unsafe { w.bits(0xFFFFFFFF) });
+    }
+
+    fn configure_endpoint(
         &mut self,
-        ep_addr: Option<EndpointAddress>,
-        ep_dir: UsbDirection,
-        ep_type: EndpointType,
-        max_packet_size: u16,
-    ) -> UsbResult<EndpointAddress> {
-        let ep_addr = ep_addr
-            .or_else(|| {
-                let eps = if ep_dir == UsbDirection::In {
-                    self.in_endpoints.iter()
-                } else {
-                    self.out_endpoints.iter()
-                };
-                // find free end point
-                let mut iter = eps.enumerate();
-                // reserve ep0 for the control endpoint
-                if ep_type != EndpointType::Control {
-                    iter.next();
+        endpoint_index: u8,
+        endpoint_type: usbctrl_dpram::ep1_in_control::ENDPOINT_TYPE_A,
+        buffer_length: u16,
+        double_buffered: bool,
+    ) {
+        assert_eq!(buffer_length & 63, 0);
+        if endpoint_index < 2 {
+            assert_eq!(endpoint_index & 1, 0);
+            assert_eq!(
+                endpoint_type,
+                usbctrl_dpram::ep1_in_control::ENDPOINT_TYPE_A::CONTROL
+            );
+            assert_eq!(buffer_length, if double_buffered { 64 * 2 } else { 64 });
+            self.controller.sie_ctrl.write(|w| {
+                if double_buffered {
+                    w.ep0_double_buf().set_bit();
                 }
-                iter.find(|(_, ep)| ep.is_none())
-                    .map(|(index, _)| EndpointAddress::from_parts(index, ep_dir))
-            })
-            .ok_or(UsbError::EndpointOverflow)?;
-
-        let is_ep0 = ep_addr.index() == 0;
-        let is_ctrl_ep = ep_type == EndpointType::Control;
-        if !(is_ep0 ^ !is_ctrl_ep) {
-            return Err(UsbError::Unsupported);
-        }
-
-        let eps = if ep_addr.is_in() {
-            &mut self.in_endpoints
-        } else {
-            &mut self.out_endpoints
-        };
-        let maybe_ep = eps
-            .get_mut(ep_addr.index())
-            .ok_or(UsbError::EndpointOverflow)?;
-        if maybe_ep.is_some() {
-            return Err(UsbError::InvalidEndpoint);
-        }
-
-        // Validate buffer size. From datasheet (4.1.2.5):
-        // Data Buffers are typically 64 bytes long as this is the max normal packet size for most FS packets.
-        // For Isochronous endpoints a maximum buffer size of 1023 bytes is supported.
-        // For other packet types the maximum size is 64 bytes per buffer.
-        if (ep_type != EndpointType::Isochronous && max_packet_size > 64) || max_packet_size > 1023
-        {
-            return Err(UsbError::Unsupported);
-        }
-
-        if ep_addr.index() == 0 {
-            *maybe_ep = Some(Endpoint {
-                ep_type,
-                max_packet_size,
-                buffer_offset: 0, // not used on CTRL ep
+                // if int_stall { w.ep0_int_stall().set_bit(); }
+                // if int_nak { w.ep0_int_nak().set_bit(); }
+                w.ep0_int_1buf().set_bit()
             });
         } else {
-            // size in 64bytes units.
-            // NOTE: the compiler is smart enough to recognize /64 as a 6bit right shift so let's
-            // keep the division here for the sake of clarity
-            let aligned_sized = (max_packet_size + 63) / 64;
-            if (self.next_offset + aligned_sized) > (4096 / 64) {
-                return Err(UsbError::EndpointMemoryOverflow);
-            }
-
-            let buffer_offset = self.next_offset;
-            self.next_offset += aligned_sized;
-
-            *maybe_ep = Some(Endpoint {
-                ep_type,
-                max_packet_size,
-                buffer_offset,
-            });
-        }
-        Ok(ep_addr)
-    }
-
-    fn ep_reset_all(&mut self) {
-        self.ctrl_reg
-            .sie_ctrl
-            .modify(|_, w| w.ep0_int_1buf().set_bit());
-        // expect ctrl ep to receive on DATA first
-        self.ctrl_dpram.ep_buffer_control[0].write(|w| w.pid_0().set_bit());
-        self.ctrl_dpram.ep_buffer_control[1].write(|w| {
-            w.available_0().set_bit();
-            w.pid_0().set_bit()
-        });
-
-        for (index, ep) in itertools::interleave(
-            self.in_endpoints.iter().skip(1),  // skip control endpoint
-            self.out_endpoints.iter().skip(1), // skip control endpoint
-        )
-        .enumerate()
-        .filter_map(|(i, ep)| ep.as_ref().map(|ep| (i, ep)))
-        {
-            use pac::usbctrl_dpram::ep_control::ENDPOINT_TYPE_A;
-            let ep_type = match ep.ep_type {
-                EndpointType::Bulk => ENDPOINT_TYPE_A::BULK,
-                EndpointType::Isochronous => ENDPOINT_TYPE_A::ISOCHRONOUS,
-                EndpointType::Control => ENDPOINT_TYPE_A::CONTROL,
-                EndpointType::Interrupt => ENDPOINT_TYPE_A::INTERRUPT,
-            };
-            // configure
-            // ep 0 in&out are not part of index (skipped before enumeration)
-            self.ctrl_dpram.ep_control[index].modify(|_, w| unsafe {
-                w.endpoint_type().variant(ep_type);
-                w.interrupt_per_buff().set_bit();
-                w.enable().set_bit();
-                w.buffer_address().bits(0x180 + (ep.buffer_offset << 6))
-            });
-            // reset OUT ep and prepare IN ep to accept data
-            let buf_control = &self.ctrl_dpram.ep_buffer_control[index + 2];
-            if (index & 1) == 0 {
-                // first write occur on DATA0 so prepare the pid bit to be flipped
-                buf_control.write(|w| w.pid_0().set_bit());
+            let register = self.endpoint_control_register(endpoint_index);
+            let buffer_start = if endpoint_index == 2 {
+                BUFFERS_START_OFFSET
             } else {
-                buf_control.write(|w| unsafe {
-                    w.available_0().set_bit();
-                    w.pid_0().clear_bit();
-                    w.length_0().bits(ep.max_packet_size)
-                });
+                register.read().buffer_address().bits()
+            };
+            register.write(|w| unsafe {
+                if buffer_length > 0 {
+                    w.enable().set_bit();
+                }
+                if double_buffered {
+                    w.double_buffered().set_bit();
+                }
+                // if int_stall { w.interrupt_on_stall().set_bit(); }
+                // if int_nak { w.interrupt_on_nak().set_bit(); }
+                w.interrupt_per_buff()
+                    .set_bit()
+                    .endpoint_type()
+                    .bits(endpoint_type as u8)
+                    .buffer_address()
+                    .bits(buffer_start)
+            });
+            if endpoint_index + 1 < NUMBER_OF_ENDPOINTS {
+                let register = self.endpoint_control_register(endpoint_index + 1);
+                register
+                    .write(|w| unsafe { w.buffer_address().bits(buffer_start + buffer_length) });
             }
         }
     }
 
-    fn ep_write(&mut self, ep_addr: EndpointAddress, buf: &[u8]) -> UsbResult<usize> {
-        let index = ep_addr.index();
-        let ep = self
-            .in_endpoints
-            .get_mut(index)
-            .map(Option::as_mut)
-            .flatten()
-            .ok_or(UsbError::InvalidEndpoint)?;
+    fn endpoint_buffer(
+        &mut self,
+        endpoint_index: u8,
+        use_received_length: bool,
+    ) -> &'static mut [u8] {
+        // TODO: Double buffering
+        let (buffer_start, buffer_end) = if endpoint_index < 2 {
+            (BUFFERS_START_OFFSET - 64 * 2, BUFFERS_START_OFFSET - 64)
+        } else {
+            (
+                if endpoint_index == 2 {
+                    BUFFERS_START_OFFSET
+                } else {
+                    self.endpoint_control_register(endpoint_index)
+                        .read()
+                        .buffer_address()
+                        .bits()
+                },
+                if endpoint_index + 1 >= NUMBER_OF_ENDPOINTS {
+                    BUFFERS_END_OFFSET
+                } else {
+                    self.endpoint_control_register(endpoint_index + 1)
+                        .read()
+                        .buffer_address()
+                        .bits()
+                },
+            )
+        };
+        let double_buffer_index = (self.controller.buff_cpu_should_handle.read().bits()
+            >> Self::endpoint_address_to_index(endpoint_index))
+            & 1;
+        let offset = double_buffer_index as usize * 64;
+        let received_length = self
+            .endpoint_buffer_control_register(endpoint_index)
+            .read()
+            .length_0()
+            .bits() as usize;
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                core::mem::transmute::<_, *mut u8>(pac::USBCTRL_DPRAM::ptr())
+                    .add(buffer_start as usize + offset),
+                // core::mem::transmute::<_, *mut u8>(&self.memory).add(buffer_start as usize),
+                if use_received_length {
+                    received_length
+                } else {
+                    (buffer_end - buffer_start) as usize
+                },
+            )
+        }
+    }
 
-        let buf_control = &self.ctrl_dpram.ep_buffer_control[index * 2];
-        if buf_control.read().available_0().bit_is_set() {
-            return Err(UsbError::WouldBlock);
+    fn endpoint_descriptor(&mut self, endpoint_index: u8) -> EndpointDescriptor {
+        let register_read = self.endpoint_control_register(endpoint_index).read();
+        EndpointDescriptor {
+            bLength: core::mem::size_of::<EndpointDescriptor>() as u8,
+            bDescriptorType: DescriptorType::Endpoint,
+            bEndpointAddress: Self::endpoint_index_to_address(endpoint_index),
+            bmAttributes: register_read.endpoint_type().bits(),
+            wMaxPacketSize: self.endpoint_buffer(endpoint_index, false).len() as u16,
+            bInterval: 1,
+        }
+    }
+
+    fn send(&mut self, endpoint_index: u8, data: &[u8]) {
+        let buffer = self.endpoint_buffer(endpoint_index, false);
+        assert!(data.len() <= buffer.len());
+        buffer[0..data.len()].copy_from_slice(data);
+        self.endpoint_buffer_control_register(endpoint_index)
+            .modify(|r, w| unsafe {
+                w.available_0()
+                    .set_bit()
+                    .length_0()
+                    .bits(data.len() as u16)
+                    .full_0()
+                    .set_bit()
+                    .stall()
+                    .clear_bit()
+            });
+    }
+
+    fn receive(&mut self, endpoint_index: u8) {
+        self.endpoint_buffer_control_register(endpoint_index)
+            .modify(|r, w| unsafe {
+                w.available_0()
+                    .set_bit()
+                    .length_0()
+                    .bits(self.endpoint_buffer(endpoint_index, false).len() as u16)
+                    .full_0()
+                    .clear_bit()
+                    .stall()
+                    .clear_bit()
+            });
+    }
+}
+
+pub struct Usb<C: UsbController, M: UsbMemory> {
+    common: UsbCommon<C, M>,
+    state: BusState,
+}
+
+static mut USB: *mut Usb<pac::USBCTRL_REGS, pac::USBCTRL_DPRAM> = core::ptr::null_mut();
+
+impl<C: UsbController, M: UsbMemory> Usb<C, M> {
+    /// Releases the underlying controller and memory.
+    pub fn free(self) -> (C, M) {
+        (self.common.controller, self.common.memory)
+    }
+
+    /// Is connected and not suspended
+    pub fn is_running(&self) -> bool {
+        self.common
+            .controller
+            .sie_status
+            .read()
+            .connected()
+            .bit_is_set()
+            && !self
+                .common
+                .controller
+                .sie_status
+                .read()
+                .suspended()
+                .bit_is_set()
+    }
+
+    /// Enable bus
+    pub fn connect(&mut self) {
+        unsafe {
+            USB = core::mem::transmute(&*self);
+            cortex_m::peripheral::NVIC::unmask(pac::Interrupt::USBCTRL_IRQ);
+        }
+        match &self.state {
+            BusState::Device(_device) => {
+                self.common
+                    .controller
+                    .sie_ctrl
+                    .modify(|_, w| w.pullup_en().set_bit());
+            }
+        }
+    }
+
+    /// Disable bus
+    pub fn disconnect(&mut self) {
+        unsafe {
+            cortex_m::peripheral::NVIC::mask(pac::Interrupt::USBCTRL_IRQ);
+            USB = core::ptr::null_mut();
+        }
+        match &self.state {
+            BusState::Device(_device) => {
+                self.common
+                    .controller
+                    .sie_ctrl
+                    .modify(|_, w| w.pullup_en().clear_bit());
+            }
+        }
+    }
+}
+
+pub struct UsbDevice {
+    address: u8,
+    configuration: u8,
+}
+
+impl UsbDevice {
+    /// Resets the bus and becomes an USB device
+    pub fn new<C: UsbController, M: UsbMemory>(
+        controller: C,
+        memory: M,
+        resets: &mut RESETS,
+    ) -> Usb<C, M> {
+        let mut common = UsbCommon { controller, memory };
+        common.controller.reset_bring_down(resets);
+        common.controller.reset_bring_up(resets);
+
+        for byte in unsafe {
+            core::slice::from_raw_parts_mut(core::mem::transmute(pac::USBCTRL_DPRAM::ptr()), 0x1000)
+        } {
+            *byte = 0;
         }
 
-        let ep_buf = ep.get_buf_mut();
-        if ep_buf.len() < buf.len() {
-            return Err(UsbError::BufferOverflow);
-        }
-        ep_buf[..buf.len()].copy_from_slice(buf);
+        common
+            .controller
+            .usb_muxing
+            .write(|w| w.to_phy().set_bit().softcon().set_bit());
 
-        buf_control.modify(|r, w| unsafe {
-            w.available_0().set_bit();
-            w.length_0().bits(buf.len() as u16);
-            w.full_0().set_bit();
-            w.pid_0().bit(!r.pid_0().bit())
+        common.controller.usb_pwr.write(|w| {
+            w.vbus_detect()
+                .set_bit()
+                .vbus_detect_override_en()
+                .set_bit()
         });
 
-        Ok(buf.len())
+        // Enable the USB controller in device mode.
+        common
+            .controller
+            .main_ctrl
+            .write(|w| w.controller_en().set_bit());
+
+        common.controller.inte.write(|w| {
+            w.setup_req()
+                .set_bit()
+                .buff_status()
+                .set_bit()
+                .bus_reset()
+                .set_bit()
+        });
+
+        common.configure_endpoint(
+            0,
+            usbctrl_dpram::ep1_in_control::ENDPOINT_TYPE_A::CONTROL,
+            64,
+            false,
+        );
+        common.configure_endpoint(
+            2,
+            usbctrl_dpram::ep1_in_control::ENDPOINT_TYPE_A::BULK,
+            0,
+            false,
+        );
+        common.configure_endpoint(
+            3,
+            usbctrl_dpram::ep1_in_control::ENDPOINT_TYPE_A::BULK,
+            64,
+            false,
+        );
+        common.configure_endpoint(
+            4,
+            usbctrl_dpram::ep1_in_control::ENDPOINT_TYPE_A::BULK,
+            64,
+            false,
+        );
+        common.receive(3);
+
+        Usb {
+            common,
+            state: BusState::Device(UsbDevice {
+                address: 0,
+                configuration: 0,
+            }),
+        }
     }
 
-    fn ep_read(&mut self, ep_addr: EndpointAddress, buf: &mut [u8]) -> UsbResult<usize> {
-        let index = ep_addr.index();
-        let ep = self
-            .out_endpoints
-            .get_mut(index)
-            .map(Option::as_mut)
-            .flatten()
-            .ok_or(UsbError::InvalidEndpoint)?;
-
-        let buf_control = &self.ctrl_dpram.ep_buffer_control[index * 2 + 1];
-        let buf_control_val = buf_control.read();
-
-        let process_setup = index == 0 && self.read_setup;
-        let (ep_buf, len) = if process_setup {
-            // assume we want to read the setup request
-
-            // Next packet will be on DATA1 so clear pid_0 so it gets flipped by next buf config
-            self.ctrl_dpram.ep_buffer_control[0].modify(|_, w| w.pid_0().clear_bit());
-            // the OUT packet will be either data or a status zlp
-            // clear setup request flag
-            self.ctrl_reg.sie_status.write(|w| w.setup_rec().set_bit());
-            (
-                unsafe { core::slice::from_raw_parts(USBCTRL_DPRAM::ptr() as *const u8, 8) },
-                8,
+    fn handle_setup_packet<C: UsbController, M: UsbMemory>(
+        &mut self,
+        common: &mut UsbCommon<C, M>,
+    ) {
+        let request = unsafe {
+            core::mem::transmute::<_, Request>(
+                common.memory.setup_packet_low.read().brequest().bits(),
             )
-        } else {
-            if buf_control_val.full_0().bit_is_clear() {
-                return Err(UsbError::WouldBlock);
-            }
-            let len: usize = buf_control_val.length_0().bits().into();
-            (ep.get_buf(), len)
         };
 
-        if len > buf.len() {
-            return Err(UsbError::BufferOverflow);
-        }
-
-        buf[..len].copy_from_slice(&ep_buf[..len]);
-
-        if process_setup {
-            self.read_setup = false;
-
-            // clear any out standing out flag e.g. in case a zlp got discarded
-            self.ctrl_reg.buff_status.write(|w| unsafe { w.bits(2) });
-
-            let data_length = u16::from(buf[6]) | (u16::from(buf[7]) << 8);
-            let is_in_request = (buf[0] & 0x80) == 0x80;
-            let expect_data_or_zlp = is_in_request || data_length != 0;
-            buf_control.modify(|_, w| unsafe {
-                // enable if and only if a dataphase is expected.
-                w.available_0().bit(expect_data_or_zlp);
-                w.length_0().bits(ep.max_packet_size);
-                w.full_0().clear_bit();
-                w.pid_0().set_bit()
-            });
-        } else {
-            buf_control.modify(|r, w| unsafe {
-                w.available_0().set_bit();
-                w.length_0().bits(ep.max_packet_size);
-                w.full_0().clear_bit();
-                w.pid_0().bit(!r.pid_0().bit())
-            });
-            // Clear OUT flag once it is read.
-            self.ctrl_reg
-                .buff_status
-                .write(|w| unsafe { w.bits(1 << (index * 2 + 1)) });
-        }
-
-        Ok(len)
-    }
-}
-
-/// Usb bus
-pub struct UsbBus {
-    inner: Mutex<RefCell<Inner>>,
-}
-
-impl UsbBus {
-    /// Create new usb bus struct and bring up usb as device.
-    pub fn new(
-        ctrl_reg: USBCTRL_REGS,
-        ctrl_dpram: USBCTRL_DPRAM,
-        _pll: UsbClock,
-        force_vbus_detect_bit: bool,
-        resets: &mut RESETS,
-    ) -> Self {
-        ctrl_reg.reset_bring_down(resets);
-        ctrl_reg.reset_bring_up(resets);
-
-        unsafe {
-            let raw_ctrl_reg =
-                core::slice::from_raw_parts_mut(USBCTRL_REGS::ptr() as *mut u32, 1 + 0x98 / 4);
-            raw_ctrl_reg.fill(0);
-
-            let raw_ctrl_pdram =
-                core::slice::from_raw_parts_mut(USBCTRL_DPRAM::ptr() as *mut u32, 1 + 0xfc / 4);
-            raw_ctrl_pdram.fill(0);
-        }
-
-        ctrl_reg.usb_muxing.modify(|_, w| {
-            w.to_phy().set_bit();
-            w.softcon().set_bit()
-        });
-
-        if force_vbus_detect_bit {
-            ctrl_reg.usb_pwr.modify(|_, w| {
-                w.vbus_detect().set_bit();
-                w.vbus_detect_override_en().set_bit()
-            });
-        }
-        ctrl_reg.main_ctrl.modify(|_, w| {
-            w.sim_timing().clear_bit();
-            w.host_ndevice().clear_bit();
-            w.controller_en().set_bit()
-        });
-
-        Self {
-            inner: Mutex::new(RefCell::new(Inner::new(ctrl_reg, ctrl_dpram))),
-        }
-    }
-}
-
-impl UsbBusTrait for UsbBus {
-    fn alloc_ep(
-        &mut self,
-        ep_dir: UsbDirection,
-        ep_addr: Option<EndpointAddress>,
-        ep_type: EndpointType,
-        max_packet_size: u16,
-        _interval: u8,
-    ) -> UsbResult<EndpointAddress> {
-        interrupt::free(|cs| {
-            let mut inner = self.inner.borrow(cs).borrow_mut();
-
-            inner.ep_allocate(ep_addr, ep_dir, ep_type, max_packet_size)
-        })
-    }
-
-    fn enable(&mut self) {
-        interrupt::free(|cs| {
-            let inner = self.inner.borrow(cs).borrow_mut();
-            // at this stage ep's are expected to be in their reset state
-            // TODO: is it worth having a debug_assert for that here?
-
-            // Enable interrupt generation when a buffer is done, when the bus is reset,
-            // and when a setup packet is received
-            // this should be sufficient for device mode, will need more for host.
-            inner.ctrl_reg.inte.modify(|_, w| {
-                w.buff_status()
-                    .set_bit()
-                    .bus_reset()
-                    .set_bit()
-                    .setup_req()
-                    .set_bit()
-            });
-
-            // enable pull up to let the host know we exist.
-            inner
-                .ctrl_reg
-                .sie_ctrl
-                .modify(|_, w| w.pullup_en().set_bit());
-        })
-    }
-    fn reset(&self) {
-        interrupt::free(|cs| {
-            let mut inner = self.inner.borrow(cs).borrow_mut();
-
-            // clear reset flag
-            inner.ctrl_reg.sie_status.write(|w| w.bus_reset().set_bit());
-            inner
-                .ctrl_reg
-                .buff_status
-                .write(|w| unsafe { w.bits(0xFFFF_FFFF) });
-
-            // reset all endpoints
-            inner.ep_reset_all();
-
-            // Reset address register
-            inner.ctrl_reg.addr_endp.reset();
-            // TODO: RP2040-E5: work around implementation
-            // TODO: reset all endpoints & buffer statuses
-        })
-    }
-    fn set_device_address(&self, addr: u8) {
-        interrupt::free(|cs| {
-            let inner = self.inner.borrow(cs).borrow_mut();
-            inner
-                .ctrl_reg
-                .addr_endp
-                .modify(|_, w| unsafe { w.address().bits(addr & 0x3F) });
-            // reset ep0
-            inner.ctrl_dpram.ep_buffer_control[0].modify(|_, w| w.pid_0().set_bit());
-            inner.ctrl_dpram.ep_buffer_control[1].modify(|_, w| w.pid_0().set_bit());
-        })
-    }
-    fn write(&self, ep_addr: EndpointAddress, buf: &[u8]) -> UsbResult<usize> {
-        interrupt::free(|cs| {
-            let mut inner = self.inner.borrow(cs).borrow_mut();
-            inner.ep_write(ep_addr, buf)
-        })
-    }
-    fn read(&self, ep_addr: EndpointAddress, buf: &mut [u8]) -> UsbResult<usize> {
-        interrupt::free(|cs| {
-            let mut inner = self.inner.borrow(cs).borrow_mut();
-            inner.ep_read(ep_addr, buf)
-        })
-    }
-    fn set_stalled(&self, ep_addr: EndpointAddress, stalled: bool) {
-        interrupt::free(|cs| {
-            let inner = self.inner.borrow(cs).borrow_mut();
-
-            if ep_addr.index() == 0 {
-                inner.ctrl_reg.ep_stall_arm.modify(|_, w| {
-                    if ep_addr.is_in() {
-                        w.ep0_in().bit(stalled)
-                    } else {
-                        w.ep0_out().bit(stalled)
+        match common.memory.setup_packet_low.read().bmrequesttype().bits() & 0x9F {
+            0x00 => {
+                // Host to Device
+                let wvalue = common.memory.setup_packet_low.read().wvalue().bits();
+                match request {
+                    Request::ClearFeature => {
+                        let _feature = wvalue;
                     }
-                });
+                    Request::SetFeature => {
+                        let _feature = wvalue;
+                    }
+                    Request::SetAddress => {
+                        self.address = wvalue as u8;
+                    }
+                    Request::SetConfiguration => {
+                        self.configuration = wvalue as u8;
+                        common.reset_endpoint_pids();
+                    }
+                    Request::SetDescriptor => {
+                        let _descriptor_type = unsafe {
+                            core::mem::transmute::<_, DescriptorType>((wvalue >> 8) as u8)
+                        };
+                        let _descriptor_index = wvalue as u8;
+                    }
+                    _ => {}
+                }
+                common.send(0, &[]);
             }
-
-            let index = ep_addr_to_ep_buf_ctrl_idx(ep_addr);
-            inner.ctrl_dpram.ep_buffer_control[index].modify(|_, w| w.stall().bit(stalled));
-        })
-    }
-    fn is_stalled(&self, ep_addr: EndpointAddress) -> bool {
-        interrupt::free(|cs| {
-            let inner = self.inner.borrow(cs).borrow_mut();
-            let index = ep_addr_to_ep_buf_ctrl_idx(ep_addr);
-            inner.ctrl_dpram.ep_buffer_control[index]
-                .read()
-                .stall()
-                .bit_is_set()
-        })
-    }
-    fn suspend(&self) {
-        todo!()
-    }
-    fn resume(&self) {
-        todo!()
-    }
-    fn poll(&self) -> PollResult {
-        interrupt::free(|cs| {
-            let mut inner = self.inner.borrow(cs).borrow_mut();
-            // TODO: check for suspend request
-            // TODO: check for resume request
-
-            // check for bus reset
-            let sie_status = inner.ctrl_reg.sie_status.read();
-            if sie_status.bus_reset().bit_is_set() {
-                return PollResult::Reset;
+            0x01 => {
+                // Host to Interface
+                match request {
+                    Request::ClearFeature => {
+                        let _feature = common.memory.setup_packet_low.read().wvalue().bits();
+                    }
+                    Request::SetFeature => {
+                        let _feature = common.memory.setup_packet_low.read().wvalue().bits();
+                    }
+                    Request::SetInterface => {
+                        let _setting = common.memory.setup_packet_low.read().wvalue().bits();
+                        common.reset_endpoint_pids();
+                    }
+                    _ => {}
+                }
+                common.send(0, &[]);
             }
-
-            let (mut ep_out, mut ep_in_complete, mut ep_setup): (u16, u16, u16) = (0, 0, 0);
-
-            let buff_status = inner.ctrl_reg.buff_status.read().bits();
-            if buff_status != 0 {
-                // IN Complete shall only be reported once.
-                inner
-                    .ctrl_reg
-                    .buff_status
-                    .write(|w| unsafe { w.bits(0x5555_5555) });
-
-                for i in 0..32u32 {
-                    let mask = 1 << i;
-                    if (buff_status & mask) == mask {
-                        if (i & 1) == 0 {
-                            ep_in_complete |= 1 << (i / 2);
-                        } else {
-                            ep_out |= 1 << (i / 2);
+            0x02 => {
+                // Host to Endpoint
+                match request {
+                    Request::ClearFeature => {
+                        let _feature = common.memory.setup_packet_low.read().wvalue().bits();
+                    }
+                    Request::SetFeature => {
+                        let _feature = common.memory.setup_packet_low.read().wvalue().bits();
+                    }
+                    _ => {}
+                }
+                common.send(0, &[]);
+            }
+            0x80 => {
+                // Device to Host
+                match request {
+                    Request::GetStatus => {
+                        common.send(0, &[0, 0]);
+                    }
+                    Request::GetDescriptor => {
+                        let wlength =
+                            common.memory.setup_packet_high.read().wlength().bits() as usize;
+                        let wvalue = common.memory.setup_packet_low.read().wvalue().bits();
+                        let descriptor_type = unsafe {
+                            core::mem::transmute::<_, DescriptorType>((wvalue >> 8) as u8)
+                        };
+                        let descriptor_index = wvalue as u8;
+                        match descriptor_type {
+                            DescriptorType::Device => {
+                                let buffer = unsafe {
+                                    &core::mem::transmute::<_, [u8; 18]>(USB_DEVICE_DESCRIPTOR)
+                                };
+                                common.send(0, &buffer[0..wlength.min(buffer.len())]);
+                            }
+                            DescriptorType::Configuration => {
+                                let mut buffer = [0; 32];
+                                buffer[0..9].copy_from_slice(unsafe {
+                                    &core::mem::transmute::<_, [u8; 9]>(
+                                        USB_CONFIGURATION_DESCRIPTOR,
+                                    )
+                                });
+                                buffer[9..18].copy_from_slice(unsafe {
+                                    &core::mem::transmute::<_, [u8; 9]>(USB_INTERFACE_DESCRIPTOR)
+                                });
+                                buffer[18..25].copy_from_slice(unsafe {
+                                    &core::mem::transmute::<_, [u8; 7]>(
+                                        common.endpoint_descriptor(3),
+                                    )
+                                });
+                                buffer[25..32].copy_from_slice(unsafe {
+                                    &core::mem::transmute::<_, [u8; 7]>(
+                                        common.endpoint_descriptor(4),
+                                    )
+                                });
+                                common.send(0, &buffer[0..wlength.min(buffer.len())]);
+                            }
+                            DescriptorType::String => {
+                                let _lang_id =
+                                    common.memory.setup_packet_high.read().windex().bits();
+                                let mut buffer = [0; 64];
+                                let length = if descriptor_index == 0 {
+                                    buffer[2] = 0x09;
+                                    buffer[3] = 0x04;
+                                    4
+                                } else {
+                                    let string = USB_STRING_TABLE[descriptor_index as usize - 1];
+                                    let mut length = 2;
+                                    for word in string.encode_utf16() {
+                                        buffer[length] = word as u8;
+                                        length += 1;
+                                        buffer[length] = (word >> 8) as u8;
+                                        length += 1;
+                                    }
+                                    length
+                                };
+                                buffer[0] = length as u8;
+                                buffer[1] = DescriptorType::String as u8;
+                                common.send(0, &buffer[0..wlength.min(length)]);
+                            }
+                            _ => {}
                         }
                     }
+                    Request::GetConfiguration => {
+                        common.send(0, &[self.configuration]);
+                    }
+                    _ => {}
                 }
             }
-            // check for setup request
-            // Only report setup if OUT has been cleared.
-            if sie_status.setup_rec().bit_is_set() {
-                // Small max_packet_size_ep0 Work-Around
-                inner.ctrl_dpram.ep_buffer_control[0].modify(|_, w| w.available_0().clear_bit());
-
-                ep_setup |= 1;
-                inner.read_setup = true;
+            0x81 => {
+                // Interface to Host
+                match request {
+                    Request::GetStatus => {
+                        common.send(0, &[]);
+                    }
+                    Request::GetInterface => {
+                        common.send(0, &[0]);
+                    }
+                    _ => {}
+                }
             }
-
-            if let (0, 0, 0) = (ep_out, ep_in_complete, ep_setup) {
-                return PollResult::None;
+            0x82 => {
+                // Endpoint to Host
+                match request {
+                    Request::GetStatus => {
+                        common.send(0, &[0]);
+                    }
+                    Request::SynchFrame => {}
+                    _ => {}
+                }
             }
-            PollResult::Data {
-                ep_out,
-                ep_in_complete,
-                ep_setup,
-            }
-        })
+            _ => {}
+        }
     }
 
-    const QUIRK_SET_ADDRESS_BEFORE_STATUS: bool = false;
+    fn isr<C: UsbController, M: UsbMemory>(&mut self, common: &mut UsbCommon<C, M>) {
+        if common.controller.ints.read().setup_req().bit_is_set() {
+            common
+                .endpoint_buffer_control_register(0)
+                .modify(|_, w| w.pid_0().set_bit());
+            self.handle_setup_packet(common);
+            common
+                .controller
+                .sie_status
+                .modify(|_, w| w.setup_rec().set_bit());
+        }
+        if common.controller.ints.read().buff_status().bit_is_set() {
+            if (common.controller.buff_status.read().bits() & (1 << 0)) != 0 {
+                common.receive(1);
+                common
+                    .controller
+                    .addr_endp
+                    .write(|w| unsafe { w.address().bits(self.address) });
+            }
+            /*if (common.controller.buff_status.read().bits() & (1 << 1)) != 0 {
+
+            }*/
+            if (common.controller.buff_status.read().bits() & (1 << 3)) != 0 {
+                let buffer = common.endpoint_buffer(3, true);
+                for character in buffer.iter_mut() {
+                    if *character >= 97 && *character <= 122 {
+                        *character -= 32;
+                    }
+                }
+                common.send(4, buffer);
+            }
+            if (common.controller.buff_status.read().bits() & (1 << 4)) != 0 {
+                common.receive(3);
+            }
+            common.handle_endpoint_buffers();
+        }
+        if common.controller.ints.read().bus_reset().bit_is_set() {
+            self.address = 0;
+            self.configuration = 0;
+            common.controller.addr_endp.write(|w| w);
+            common
+                .controller
+                .sie_status
+                .modify(|_, w| w.bus_reset().set_bit());
+        }
+    }
+}
+
+/// USB interrupt service routine
+#[allow(non_snake_case)]
+pub unsafe extern "C" fn USBCTRL_IRQ() {
+    match &mut (*USB).state {
+        BusState::Device(usb_device) => {
+            usb_device.isr(&mut (*USB).common);
+        }
+        /*BusState::Host(usb_host) => {
+            usb_host.isr(&mut (*USB).common);
+        }*/
+    }
 }
