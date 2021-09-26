@@ -50,7 +50,7 @@ impl UsbMemory for pac::USBCTRL_DPRAM {}
 /// Used to allocate and initialize endpoints
 pub struct EndpointConfiguration {
     /// The transfer type of this endpoint
-    pub kind: usbctrl_dpram::ep1_in_control::ENDPOINT_TYPE_A,
+    pub kind: usbctrl_dpram::ep_control::ENDPOINT_TYPE_A,
     /// Total bytes allocated for this endpoint
     ///
     /// This must be 64 bytes except if `kind` is ISOCHRONOUS,
@@ -91,34 +91,9 @@ impl<'a, C: UsbController, M: UsbMemory> UsbCommon<'a, C, M> {
     fn endpoint_control_register(
         &self,
         endpoint_index: u8,
-    ) -> &'static Reg<usbctrl_dpram::ep1_in_control::EP1_IN_CONTROL_SPEC> {
-        unsafe {
-            &*(&self.memory.ep1_in_control
-                as *const Reg<usbctrl_dpram::ep1_in_control::EP1_IN_CONTROL_SPEC>)
-                .add(endpoint_index as usize - 2)
-        }
+    ) -> &Reg<usbctrl_dpram::ep_control::EP_CONTROL_SPEC> {
+        &self.memory.ep_control[endpoint_index as usize - 2]
     }
-
-    fn endpoint_buffer_control_register(
-        &self,
-        endpoint_index: u8,
-    ) -> &'static Reg<usbctrl_dpram::ep0_in_buffer_control::EP0_IN_BUFFER_CONTROL_SPEC> {
-        unsafe {
-            &*(&self.memory.ep0_in_buffer_control
-                as *const Reg<usbctrl_dpram::ep0_in_buffer_control::EP0_IN_BUFFER_CONTROL_SPEC>)
-                .add(endpoint_index as usize)
-        }
-    }
-
-    /*fn endpoint_address_control_register(
-        &self,
-        endpoint_index: u8,
-    ) -> &'static Reg<usbctrl_regs::addr_endp1::ADDR_ENDP1_SPEC> {
-        unsafe {
-            &*(&self.controller.addr_endp1 as *const Reg<usbctrl_regs::addr_endp1::ADDR_ENDP1_SPEC>)
-                .add((endpoint_index as usize >> 1) - 1)
-        }
-    }*/
 
     fn reset(&mut self, resets: &mut RESETS) {
         self.controller.reset_bring_down(resets);
@@ -140,13 +115,12 @@ impl<'a, C: UsbController, M: UsbMemory> UsbCommon<'a, C, M> {
             // if int_nak { w.ep0_int_nak().set_bit(); }
             w.ep0_int_1buf().set_bit()
         });
-        self.endpoint_buffer_control_register(0)
-            .modify(|_, w| w.pid_0().set_bit().pid_1().set_bit());
+        self.memory.ep_buffer_control[0].modify(|_, w| w.pid_0().set_bit().pid_1().set_bit());
     }
 
     fn reset_endpoint_pids(&mut self) {
         for endpoint_index in 2..NUMBER_OF_ENDPOINTS * 2 {
-            self.endpoint_buffer_control_register(endpoint_index)
+            self.memory.ep_buffer_control[endpoint_index as usize]
                 .modify(|_, w| w.pid_0().clear_bit().pid_1().clear_bit());
         }
     }
@@ -176,11 +150,11 @@ impl<'a, C: UsbController, M: UsbMemory> UsbCommon<'a, C, M> {
                         .buffer_address()
                         .bits(buffer_start)
                 });
-            if endpoint.kind == usbctrl_dpram::ep1_in_control::ENDPOINT_TYPE_A::ISOCHRONOUS {
+            if endpoint.kind == usbctrl_dpram::ep_control::ENDPOINT_TYPE_A::ISOCHRONOUS {
                 if endpoint.is_double_buffered {
                     let log2 = endpoint.buffer_length.trailing_zeros() as u8;
                     assert!(endpoint.buffer_length == 1 << log2 && log2 >= 8 && log2 < 12);
-                    self.endpoint_buffer_control_register(endpoint_index)
+                    self.memory.ep_buffer_control[endpoint_index as usize]
                         .write(|w| w.double_buffer_iso_offset().bits(log2 - 8));
                 } else {
                     assert!(
@@ -194,7 +168,7 @@ impl<'a, C: UsbController, M: UsbMemory> UsbCommon<'a, C, M> {
             }
             buffer_start += endpoint.buffer_length;
         }
-        self.endpoint_control_register(2 + endpoints.len() as u8)
+        self.memory.ep_control[endpoints.len()]
             .write(|w| unsafe { w.buffer_address().bits(buffer_start) });
     }
 
@@ -258,35 +232,34 @@ impl<'a, C: UsbController, M: UsbMemory> UsbCommon<'a, C, M> {
 
     fn endpoint_transfer(&mut self, endpoint_index: u8, send: bool, length: usize) {
         let (_, double_buffer_index) = self.get_endpoint_double_buffering(endpoint_index);
-        self.endpoint_buffer_control_register(endpoint_index)
-            .modify(|_, w| unsafe {
-                if double_buffer_index == 0 {
-                    w.available_0()
-                        .set_bit()
-                        .full_0()
-                        .bit(send)
-                        .length_0()
-                        .bits(length as u16)
-                    // .last_0()
-                    // .bit(end_of_transfer)
-                } else {
-                    w.available_1()
-                        .set_bit()
-                        .full_1()
-                        .bit(send)
-                        .length_1()
-                        .bits(length as u16)
-                    // .last_1()
-                    // .bit(end_of_transfer)
-                }
-            });
+        self.memory.ep_buffer_control[endpoint_index as usize].modify(|_, w| unsafe {
+            if double_buffer_index == 0 {
+                w.available_0()
+                    .set_bit()
+                    .full_0()
+                    .bit(send)
+                    .length_0()
+                    .bits(length as u16)
+                // .last_0()
+                // .bit(end_of_transfer)
+            } else {
+                w.available_1()
+                    .set_bit()
+                    .full_1()
+                    .bit(send)
+                    .length_1()
+                    .bits(length as u16)
+                // .last_1()
+                // .bit(end_of_transfer)
+            }
+        });
     }
 
     fn trigger_endpoint(&mut self, endpoint_index: u8) -> bool {
         let (_, double_buffer_index) = self.get_endpoint_double_buffering(endpoint_index);
         let sending = endpoint_index & 1 == 0;
         let buffer = self.get_endpoint_buffer(endpoint_index);
-        let register = self.endpoint_buffer_control_register(endpoint_index);
+        let register = &self.memory.ep_buffer_control[endpoint_index as usize];
         let (in_use, transferred_length) = if double_buffer_index == 0 {
             (
                 register.read().available_0().bit(),
@@ -320,13 +293,12 @@ impl<'a, C: UsbController, M: UsbMemory> UsbCommon<'a, C, M> {
         for endpoint_index in 2..NUMBER_OF_ENDPOINTS * 2 {
             if needs_handling & (1 << endpoint_index) != 0 {
                 self.trigger_endpoint(endpoint_index);
-                self.endpoint_buffer_control_register(endpoint_index)
-                    .modify(|r, w| {
-                        w.pid_0()
-                            .bit(!r.pid_0().bit_is_set())
-                            .pid_1()
-                            .bit(!r.pid_1().bit_is_set())
-                    });
+                self.memory.ep_buffer_control[endpoint_index as usize].modify(|r, w| {
+                    w.pid_0()
+                        .bit(!r.pid_0().bit_is_set())
+                        .pid_1()
+                        .bit(!r.pid_1().bit_is_set())
+                });
             }
         }
         self.controller

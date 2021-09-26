@@ -74,11 +74,11 @@ static USB_INTERFACE_ENDPOINT_MAP: &[&[u8]] = &[&[2, 3, 4]];
 
 static mut USB: *mut UsbDevice<pac::USBCTRL_REGS, pac::USBCTRL_DPRAM> = core::ptr::null_mut();
 
-/* TODO: Link this ISR in the interrupt vector
 #[allow(non_snake_case)]
-unsafe extern "C" fn USBCTRL_IRQ() {
+#[interrupt]
+unsafe fn USBCTRL_IRQ() {
     (*USB).poll();
-}*/
+}
 
 #[entry]
 fn main() -> ! {
@@ -107,21 +107,21 @@ fn main() -> ! {
     let endpoints = [
         // 2: IN Endpoint 1, Device to Host
         EndpointConfiguration {
-            kind: pac::usbctrl_dpram::ep1_in_control::ENDPOINT_TYPE_A::BULK,
+            kind: pac::usbctrl_dpram::ep_control::ENDPOINT_TYPE_A::BULK,
             buffer_length: 0, // Skip this endpoint / leave it disabled
             is_double_buffered: false,
             interval: 0,
         },
         // 3: OUT Endpoint 1, Host to Device
         EndpointConfiguration {
-            kind: pac::usbctrl_dpram::ep1_in_control::ENDPOINT_TYPE_A::BULK,
+            kind: pac::usbctrl_dpram::ep_control::ENDPOINT_TYPE_A::BULK,
             buffer_length: 64,
             is_double_buffered: false,
             interval: 1 << 2,
         },
         // 4: IN Endpoint 2, Device to Host
         EndpointConfiguration {
-            kind: pac::usbctrl_dpram::ep1_in_control::ENDPOINT_TYPE_A::BULK,
+            kind: pac::usbctrl_dpram::ep_control::ENDPOINT_TYPE_A::BULK,
             buffer_length: 64,
             is_double_buffered: false,
             interval: 1 << 2,
