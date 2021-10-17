@@ -10,7 +10,7 @@ pub enum RequestRecipient {
 }
 
 #[derive(Clone, Copy)]
-pub enum Request {
+pub enum StandardRequest {
     GetStatus = 0x00,
     ClearFeature = 0x01,
     SetFeature = 0x03,
@@ -22,6 +22,16 @@ pub enum Request {
     GetInterface = 0x0A,
     SetInterface = 0x11,
     SynchFrame = 0x12,
+}
+
+#[derive(Clone, Copy)]
+pub enum HidRequest {
+    GetReport = 0x01,
+    GetIdle = 0x02,
+    GetProtocol = 0x03,
+    SetReport = 0x09,
+    SetIdle = 0x0A,
+    SetProtocol = 0x0B,
 }
 
 #[derive(Clone, Copy)]
@@ -37,6 +47,8 @@ pub enum DescriptorType {
     OnTheGo = 9,
     Debug = 10,
     InterfaceAssociation = 11,
+    Hid = 33,
+    HidReport = 34,
 }
 
 #[repr(C)]
@@ -102,4 +114,18 @@ pub struct EndpointDescriptor {
     pub bmAttributes: u8,
     pub wMaxPacketSize: u16,
     pub bInterval: u8,
+}
+
+#[repr(C)]
+#[repr(packed)]
+#[allow(non_snake_case)]
+#[derive(Clone, Copy)]
+pub struct HidDescriptor {
+    pub bLength: u8,
+    pub bDescriptorType: DescriptorType,
+    pub bcdHID: u16,
+    pub bCountryCode: u8,
+    pub bNumDescriptors: u8,
+    pub bReportDescriptorType: u8,
+    pub bReportDescriptorLength: u16,
 }

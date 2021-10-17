@@ -79,12 +79,12 @@ fn endpoint_index_to_address(endpoint_index: u8) -> u8 {
 ///
 /// Device send: number of bytes sent last time, buffer to write data in, returns number of bytes to send or 0 to stop
 /// Device receive: number of bytes received, buffer to read from, returns number of bytes to receive next or 0 to stop
-pub type EndpointHandler<'a> = &'a mut dyn FnMut(usize, &mut [u8]) -> usize;
+pub type EndpointHandler<'a> = &'a dyn Fn(usize, &mut [u8]) -> usize;
 
 struct UsbCommon<'a, C: UsbController, M: UsbMemory> {
     controller: C,
     memory: M,
-    handlers: &'a mut [EndpointHandler<'a>],
+    handlers: &'a [EndpointHandler<'a>],
 }
 
 impl<'a, C: UsbController, M: UsbMemory> UsbCommon<'a, C, M> {
@@ -280,10 +280,7 @@ impl<'a, C: UsbController, M: UsbMemory> UsbCommon<'a, C, M> {
             buffer.len()
         };
         if length_to_transfer > 0 {
-            register.modify(|_, w| w.stall().clear_bit());
             self.endpoint_transfer(endpoint_index, sending, length_to_transfer);
-        } else {
-            register.modify(|_, w| w.stall().set_bit());
         }
         true
     }
@@ -310,14 +307,46 @@ impl<'a, C: UsbController, M: UsbMemory> UsbCommon<'a, C, M> {
 /// Localized strings with USB language code as key
 pub type StringTable<'a> = [(u16, &'a [&'static str])];
 
+/// Interface descriptor tree
+pub struct Interface<'a> {
+    /// Descriptor of this interface
+    pub descriptor: protocol::InterfaceDescriptor,
+    /// Optional USB class
+    pub class: Class<'a>,
+    /// Index into global endpoints
+    pub endpoints: &'a [u8],
+}
+
+/// Configuration descriptor tree
+pub struct Configuration<'a> {
+    /// Descriptor of this configuration
+    pub descriptor: protocol::ConfigurationDescriptor,
+    /// Interfaces in this configuration
+    pub interfaces: &'a [Interface<'a>],
+}
+
+/// HID descriptor tree
+pub struct Hid<'a> {
+    /// Descriptor of this hid
+    pub descriptor: protocol::HidDescriptor,
+    /// Report of this hid
+    pub report_descriptor: &'a [u8],
+}
+
+/// Device class
+pub enum Class<'a> {
+    /// Not specified
+    None,
+    /// Human interface device
+    Hid(Hid<'a>),
+}
+
 /// Represents the USB bus configured as a device
 pub struct UsbDevice<'a, C: UsbController, M: UsbMemory> {
     common: UsbCommon<'a, C, M>,
     string_table: &'a StringTable<'a>,
     device_descriptor: &'a protocol::DeviceDescriptor,
-    configuration_descriptors: &'a [protocol::ConfigurationDescriptor],
-    interface_descriptors: &'a [protocol::InterfaceDescriptor],
-    interface_endpoint_map: &'a [&'a [u8]],
+    configurations: &'a [Configuration<'a>],
     address: u8,
     configuration: u8,
 }
@@ -330,11 +359,9 @@ impl<'a, C: UsbController, M: UsbMemory> UsbDevice<'a, C, M> {
         resets: &mut RESETS,
         string_table: &'a StringTable,
         device_descriptor: &'a protocol::DeviceDescriptor,
-        configuration_descriptors: &'a [protocol::ConfigurationDescriptor],
-        interface_descriptors: &'a [protocol::InterfaceDescriptor],
-        interface_endpoint_map: &'a [&'a [u8]],
+        configurations: &'a [Configuration<'a>],
         endpoints: &[EndpointConfiguration],
-        handlers: &'a mut [EndpointHandler<'a>],
+        handlers: &'a [EndpointHandler<'a>],
     ) -> Self {
         let mut common = UsbCommon::<'a, C, M> {
             controller,
@@ -371,9 +398,7 @@ impl<'a, C: UsbController, M: UsbMemory> UsbDevice<'a, C, M> {
             common,
             string_table,
             device_descriptor,
-            configuration_descriptors,
-            interface_descriptors,
-            interface_endpoint_map,
+            configurations,
             address: 0,
             configuration: 0,
         }
@@ -462,6 +487,7 @@ impl<'a, C: UsbController, M: UsbMemory> UsbDevice<'a, C, M> {
     }
 
     fn handle_get_descriptor_request(&mut self, buffer: &mut [u8]) -> usize {
+        let windex = self.common.memory.setup_packet_high.read().windex().bits();
         let wvalue = self.common.memory.setup_packet_low.read().wvalue().bits();
         let descriptor_type = deserialize_value!(protocol::DescriptorType, [(wvalue >> 8) as u8]);
         let descriptor_index = (wvalue & 0xFF) as usize;
@@ -474,26 +500,33 @@ impl<'a, C: UsbController, M: UsbMemory> UsbDevice<'a, C, M> {
             }
             protocol::DescriptorType::Configuration => {
                 let mut offset = core::mem::size_of::<protocol::ConfigurationDescriptor>();
-                let configuration_descriptor = &self.configuration_descriptors[descriptor_index];
+                let configuration = &self.configurations[descriptor_index];
                 buffer[0..offset].copy_from_slice(serialize_value!(
                     protocol::ConfigurationDescriptor,
-                    *configuration_descriptor
+                    configuration.descriptor
                 ));
-                let start_index = self
-                    .configuration_descriptors
-                    .iter()
-                    .take(descriptor_index)
-                    .fold(0, |accu, conf| accu + conf.bNumInterfaces);
-                for i in start_index..start_index + configuration_descriptor.bNumInterfaces {
-                    let interface_descriptor = &self.interface_descriptors[i as usize];
+                for i in 0..configuration.descriptor.bNumInterfaces {
+                    let interface = &configuration.interfaces[i as usize];
                     buffer[offset..offset + core::mem::size_of::<protocol::InterfaceDescriptor>()]
                         .copy_from_slice(serialize_value!(
                             protocol::InterfaceDescriptor,
-                            *interface_descriptor
+                            interface.descriptor
                         ));
                     offset += core::mem::size_of::<protocol::InterfaceDescriptor>();
-                    for j in 0..interface_descriptor.bNumEndpoints {
-                        let endpoint_index = self.interface_endpoint_map[i as usize][j as usize];
+                    match &interface.class {
+                        Class::None => {}
+                        Class::Hid(hid) => {
+                            buffer
+                                [offset..offset + core::mem::size_of::<protocol::HidDescriptor>()]
+                                .copy_from_slice(serialize_value!(
+                                    protocol::HidDescriptor,
+                                    hid.descriptor
+                                ));
+                            offset += core::mem::size_of::<protocol::HidDescriptor>();
+                        }
+                    }
+                    for j in 0..interface.descriptor.bNumEndpoints {
+                        let endpoint_index = interface.endpoints[j as usize];
                         if self
                             .common
                             .endpoint_control_register(endpoint_index)
@@ -523,12 +556,10 @@ impl<'a, C: UsbController, M: UsbMemory> UsbDevice<'a, C, M> {
                         offset += 1;
                     }
                 } else {
-                    let search_lang_id =
-                        self.common.memory.setup_packet_high.read().windex().bits();
                     let lang_index = self
                         .string_table
                         .iter()
-                        .position(|(lang_id, _strings)| *lang_id == search_lang_id)
+                        .position(|(lang_id, _strings)| *lang_id == windex)
                         .unwrap();
                     let string = self.string_table[lang_index].1[descriptor_index - 1];
                     for word in string.encode_utf16() {
@@ -542,43 +573,67 @@ impl<'a, C: UsbController, M: UsbMemory> UsbDevice<'a, C, M> {
                 buffer[1] = protocol::DescriptorType::String as u8;
                 offset
             }
+            protocol::DescriptorType::Hid => {
+                let configuration = &self.configurations[self.configuration as usize - 1];
+                let interface = &configuration.interfaces[windex as usize];
+                match &interface.class {
+                    Class::Hid(hid) => {
+                        buffer[0..core::mem::size_of::<protocol::HidDescriptor>()].copy_from_slice(
+                            serialize_value!(protocol::HidDescriptor, hid.descriptor),
+                        );
+                        core::mem::size_of::<protocol::HidDescriptor>()
+                    }
+                    _ => 0,
+                }
+            }
+            protocol::DescriptorType::HidReport => {
+                let configuration = &self.configurations[self.configuration as usize - 1];
+                let interface = &configuration.interfaces[windex as usize];
+                match &interface.class {
+                    Class::Hid(hid) => {
+                        buffer[0..hid.report_descriptor.len()]
+                            .copy_from_slice(hid.report_descriptor);
+                        hid.report_descriptor.len()
+                    }
+                    _ => 0,
+                }
+            }
             _ => 0,
         }
     }
 
     fn handle_setup_packet(&mut self) {
-        let request = deserialize_value!(
-            protocol::Request,
+        let buffer = self.common.get_endpoint_buffer(0);
+        let brequest = deserialize_value!(
+            protocol::StandardRequest,
             [self.common.memory.setup_packet_low.read().brequest().bits()]
         );
-
-        match self
+        let bm_request_type = self
             .common
             .memory
             .setup_packet_low
             .read()
             .bmrequesttype()
-            .bits()
-            & 0x9F
-        {
+            .bits();
+        match bm_request_type {
             0x00 => {
                 // Host to Device
                 let wvalue = self.common.memory.setup_packet_low.read().wvalue().bits();
-                match request {
-                    protocol::Request::ClearFeature => {
+                match brequest {
+                    protocol::StandardRequest::ClearFeature => {
                         let _feature = wvalue;
                     }
-                    protocol::Request::SetFeature => {
+                    protocol::StandardRequest::SetFeature => {
                         let _feature = wvalue;
                     }
-                    protocol::Request::SetAddress => {
+                    protocol::StandardRequest::SetAddress => {
                         self.address = wvalue as u8;
                     }
-                    protocol::Request::SetConfiguration => {
+                    protocol::StandardRequest::SetConfiguration => {
                         self.configuration = wvalue as u8;
                         self.common.reset_endpoint_pids();
                     }
-                    protocol::Request::SetDescriptor => {
+                    protocol::StandardRequest::SetDescriptor => {
                         let _descriptor_type =
                             deserialize_value!(protocol::DescriptorType, [(wvalue >> 8) as u8]);
                         let _descriptor_index = wvalue as u8;
@@ -589,14 +644,14 @@ impl<'a, C: UsbController, M: UsbMemory> UsbDevice<'a, C, M> {
             }
             0x01 => {
                 // Host to Interface
-                match request {
-                    protocol::Request::ClearFeature => {
+                match brequest {
+                    protocol::StandardRequest::ClearFeature => {
                         let _feature = self.common.memory.setup_packet_low.read().wvalue().bits();
                     }
-                    protocol::Request::SetFeature => {
+                    protocol::StandardRequest::SetFeature => {
                         let _feature = self.common.memory.setup_packet_low.read().wvalue().bits();
                     }
-                    protocol::Request::SetInterface => {
+                    protocol::StandardRequest::SetInterface => {
                         let _setting = self.common.memory.setup_packet_low.read().wvalue().bits();
                         self.common.reset_endpoint_pids();
                     }
@@ -606,11 +661,11 @@ impl<'a, C: UsbController, M: UsbMemory> UsbDevice<'a, C, M> {
             }
             0x02 => {
                 // Host to Endpoint
-                match request {
-                    protocol::Request::ClearFeature => {
+                match brequest {
+                    protocol::StandardRequest::ClearFeature => {
                         let _feature = self.common.memory.setup_packet_low.read().wvalue().bits();
                     }
-                    protocol::Request::SetFeature => {
+                    protocol::StandardRequest::SetFeature => {
                         let _feature = self.common.memory.setup_packet_low.read().wvalue().bits();
                     }
                     _ => {}
@@ -619,20 +674,19 @@ impl<'a, C: UsbController, M: UsbMemory> UsbDevice<'a, C, M> {
             }
             0x80 => {
                 // Device to Host
-                let buffer = self.common.get_endpoint_buffer(0);
-                match request {
-                    protocol::Request::GetStatus => {
+                match brequest {
+                    protocol::StandardRequest::GetStatus => {
                         buffer[0] = 0;
                         buffer[1] = 0;
                         self.common.endpoint_transfer(0, true, 2);
                     }
-                    protocol::Request::GetDescriptor => {
+                    protocol::StandardRequest::GetDescriptor => {
                         let wlength =
                             self.common.memory.setup_packet_high.read().wlength().bits() as usize;
                         let length = self.handle_get_descriptor_request(buffer);
                         self.common.endpoint_transfer(0, true, wlength.min(length));
                     }
-                    protocol::Request::GetConfiguration => {
+                    protocol::StandardRequest::GetConfiguration => {
                         buffer[0] = self.configuration;
                         self.common.endpoint_transfer(0, true, 1);
                     }
@@ -641,12 +695,17 @@ impl<'a, C: UsbController, M: UsbMemory> UsbDevice<'a, C, M> {
             }
             0x81 => {
                 // Interface to Host
-                let buffer = self.common.get_endpoint_buffer(0);
-                match request {
-                    protocol::Request::GetStatus => {
+                match brequest {
+                    protocol::StandardRequest::GetStatus => {
                         self.common.endpoint_transfer(0, true, 0);
                     }
-                    protocol::Request::GetInterface => {
+                    protocol::StandardRequest::GetDescriptor => {
+                        let wlength =
+                            self.common.memory.setup_packet_high.read().wlength().bits() as usize;
+                        let length = self.handle_get_descriptor_request(buffer);
+                        self.common.endpoint_transfer(0, true, wlength.min(length));
+                    }
+                    protocol::StandardRequest::GetInterface => {
                         buffer[0] = 0;
                         self.common.endpoint_transfer(0, true, 1);
                     }
@@ -655,17 +714,57 @@ impl<'a, C: UsbController, M: UsbMemory> UsbDevice<'a, C, M> {
             }
             0x82 => {
                 // Endpoint to Host
-                let buffer = self.common.get_endpoint_buffer(0);
-                match request {
-                    protocol::Request::GetStatus => {
+                match brequest {
+                    protocol::StandardRequest::GetStatus => {
                         buffer[0] = 0;
                         self.common.endpoint_transfer(0, true, 1);
                     }
-                    protocol::Request::SynchFrame => {}
+                    protocol::StandardRequest::SynchFrame => {}
                     _ => {}
                 }
             }
-            _ => {}
+            _ => {
+                /* Class or Vendor
+                let windex = self.common.memory.setup_packet_high.read().windex().bits();
+                let wvalue = self.common.memory.setup_packet_low.read().wvalue().bits();
+                let configuration = &self.configurations[self.configuration as usize - 1];
+                let interface = &configuration.interfaces[windex as usize];
+                let brequest = deserialize_value!(
+                    protocol::HidRequest,
+                    [self.common.memory.setup_packet_low.read().brequest().bits()]
+                );
+                let length = match brequest {
+                    protocol::HidRequest::SetReport => {
+                        let _report_type = (wvalue >> 8) as u8;
+                        let _report_id = wvalue as u8;
+                        0
+                    }
+                    protocol::HidRequest::SetIdle => {
+                        let _duration = (wvalue >> 8) as u8;
+                        let _report_id = wvalue as u8;
+                        0
+                    }
+                    protocol::HidRequest::SetProtocol => {
+                        let _protocol = wvalue as u8;
+                        0
+                    }
+                    protocol::HidRequest::GetReport => {
+                        let _report_type = (wvalue >> 8) as u8;
+                        let _report_id = wvalue as u8;
+                        64
+                    }
+                    protocol::HidRequest::GetIdle => {
+                        buffer[0] = 0;
+                        1
+                    }
+                    protocol::HidRequest::GetProtocol => {
+                        buffer[0] = 0;
+                        1
+                    }
+                    _ => 0,
+                };
+                self.common.endpoint_transfer(0, true, length);*/
+            }
         }
     }
 }
